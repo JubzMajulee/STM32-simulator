@@ -43,6 +43,8 @@ const App = () => {
   const [uiState, setUiState] = useState('NORMAL');
   const [terminalInput, setTerminalInput] = useState('');
   const [pieStatus, setPieStatus] = useState('disconnected'); // 'connecting' | 'connected' | 'disconnected'
+  const [serialConnected, setSerialConnected] = useState(false);
+  const [serialError, setSerialError] = useState('');
 
   const logEndRef = useRef(null);
   const socketRef = useRef(null);
@@ -50,11 +52,19 @@ const App = () => {
   const ledOnRef = useRef(false);
   useEffect(() => { ledOnRef.current = ledOn; }, [ledOn]);
 
+  const serialPortRef = useRef(null);
+  const serialReaderRef = useRef(null);
+  const serialWriterRef = useRef(null);
+  const serialReadAbortRef = useRef(false);
+  const serialConnectedRef = useRef(false);
+  useEffect(() => { serialConnectedRef.current = serialConnected; }, [serialConnected]);
+
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [bridgeLogs]);
 
   useEffect(() => {
+    if (serialConnected) return; // Arduino is the source of truth, skip the local sim
     const interval = setInterval(() => {
       const currentVal = testMode ? testValue : temp + (Math.random() * 2 - 1);
 
@@ -70,7 +80,7 @@ const App = () => {
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [temp, testMode, testValue, lastSentTemp]);
+  }, [temp, testMode, testValue, lastSentTemp, serialConnected]);
 
   // ProtoPie Connect Socket.IO lifecycle
   useEffect(() => {
@@ -144,6 +154,91 @@ const App = () => {
     };
   }, []);
 
+  const handleSerialLine = (line) => {
+    if (line.startsWith('RPT:TEMP:')) {
+      const v = parseFloat(line.split(':')[2]);
+      if (!Number.isNaN(v)) {
+        setTemp(v);
+        setLastSentTemp(v);
+      }
+    } else if (line === 'ACK:LIGHT:ON') {
+      setLedOn(true);
+    } else if (line === 'ACK:LIGHT:OFF') {
+      setLedOn(false);
+    }
+    sendToBridge(line);
+  };
+
+  const writeSerialLine = async (line) => {
+    const writer = serialWriterRef.current;
+    if (!writer) return;
+    try {
+      await writer.write(new TextEncoder().encode(line + '\n'));
+    } catch (err) {
+      setSerialError(err.message || String(err));
+    }
+  };
+
+  const runReadLoop = async () => {
+    const reader = serialReaderRef.current;
+    if (!reader) return;
+    const decoder = new TextDecoder();
+    let buf = '';
+    try {
+      while (!serialReadAbortRef.current) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx).replace(/\r$/, '').trim();
+          buf = buf.slice(idx + 1);
+          if (line) handleSerialLine(line);
+        }
+      }
+    } catch (err) {
+      if (!serialReadAbortRef.current) setSerialError(err.message || String(err));
+    } finally {
+      setSerialConnected(false);
+    }
+  };
+
+  const connectSerial = async () => {
+    try {
+      setSerialError('');
+      if (!('serial' in navigator)) {
+        setSerialError('Web Serial API not supported. Use Chrome, Edge, or Opera.');
+        return;
+      }
+      const port = await navigator.serial.requestPort();
+      await port.open({ baudRate: 115200 });
+      serialPortRef.current = port;
+      serialWriterRef.current = port.writable.getWriter();
+      serialReaderRef.current = port.readable.getReader();
+      serialReadAbortRef.current = false;
+      setSerialConnected(true);
+      runReadLoop();
+    } catch (err) {
+      if (err && err.name === 'NotFoundError') return; // user cancelled the picker
+      setSerialError(err.message || String(err));
+    }
+  };
+
+  const disconnectSerial = async () => {
+    serialReadAbortRef.current = true;
+    try { await serialReaderRef.current?.cancel(); } catch { /* noop */ }
+    try { serialReaderRef.current?.releaseLock(); } catch { /* noop */ }
+    try { await serialWriterRef.current?.close(); } catch { /* noop */ }
+    try { serialWriterRef.current?.releaseLock(); } catch { /* noop */ }
+    try { await serialPortRef.current?.close(); } catch { /* noop */ }
+    serialReaderRef.current = null;
+    serialWriterRef.current = null;
+    serialPortRef.current = null;
+    setSerialConnected(false);
+  };
+
+  useEffect(() => () => { disconnectSerial(); }, []);
+
   const sendToBridge = (msg) => {
     const logMsg = {
       id: Date.now(),
@@ -206,6 +301,23 @@ const App = () => {
     };
     setBridgeLogs(prev => [...prev.slice(-19), logMsg]);
 
+    // When the real Arduino is connected, hand the command off to it and let it
+    // respond. Local state updates and synthetic ACKs are skipped — the read
+    // loop will pick up the Arduino's RPT/ACK and update state from there.
+    if (serialConnectedRef.current) {
+      writeSerialLine(normalized);
+      // Keep local testValue in sync so the slider/button labels reflect what
+      // we just commanded; the actual temperature reading comes back from the
+      // Arduino as RPT:TEMP and overwrites `temp` directly.
+      if (normalized.startsWith('SET:VAL:')) {
+        const val = parseFloat(normalized.split(':')[2]);
+        if (!Number.isNaN(val)) setTestValue(val);
+      }
+      if (normalized.startsWith('SET:TEST:ON')) setTestMode(true);
+      if (normalized.startsWith('SET:TEST:OFF')) setTestMode(false);
+      return;
+    }
+
     if (normalized.startsWith('SET:TEST:ON')) setTestMode(true);
     if (normalized.startsWith('SET:TEST:OFF')) setTestMode(false);
     if (normalized.startsWith('SET:VAL:')) {
@@ -256,15 +368,38 @@ const App = () => {
 
         <Card title="STM32 Microcontroller" icon={Cpu} color="border-blue-500/30">
           <div className="space-y-6">
+            <div className="bg-slate-800/50 p-3 rounded-lg border border-slate-700 flex items-center gap-3">
+              <div className={`w-2 h-2 rounded-full shrink-0 ${serialConnected ? 'bg-green-500 animate-pulse' : 'bg-slate-600'}`} />
+              <span className="text-[11px] font-mono flex-1 truncate text-slate-300">
+                {serialConnected ? 'Arduino · Live (USB)' : 'Arduino · Disconnected'}
+              </span>
+              <button
+                onClick={serialConnected ? disconnectSerial : connectSerial}
+                className={`text-[10px] font-bold py-1 px-2 rounded border transition ${serialConnected
+                  ? 'bg-red-900/40 border-red-700 text-red-300 hover:bg-red-900/60'
+                  : 'bg-blue-900/40 border-blue-700 text-blue-300 hover:bg-blue-900/60'}`}
+              >
+                {serialConnected ? 'Disconnect' : 'Connect'}
+              </button>
+            </div>
+            {serialError && (
+              <div className="text-[10px] text-red-400 font-mono -mt-3">⚠ {serialError}</div>
+            )}
             <div className="bg-slate-800/50 p-4 rounded-lg border border-slate-700">
               <div className="flex justify-between items-center mb-2">
                 <span className="text-xs text-slate-500 font-mono">SENSOR_DATA</span>
-                <span className={`text-xs px-2 py-0.5 rounded ${testMode ? 'bg-purple-500/20 text-purple-400' : 'bg-green-500/20 text-green-400'}`}>
-                  {testMode ? 'SIMULATED' : 'REAL-TIME'}
+                <span className={`text-xs px-2 py-0.5 rounded ${
+                  serialConnected
+                    ? (testMode ? 'bg-purple-500/20 text-purple-400' : 'bg-blue-500/20 text-blue-300')
+                    : (testMode ? 'bg-purple-500/20 text-purple-400' : 'bg-green-500/20 text-green-400')
+                }`}>
+                  {serialConnected
+                    ? (testMode ? 'TEST (ARDUINO)' : 'LIVE (POT)')
+                    : (testMode ? 'SIMULATED' : 'REAL-TIME (SIM)')}
                 </span>
               </div>
               <div className="text-4xl font-mono text-white text-center py-4 bg-black/30 rounded-md border border-slate-900">
-                {testMode ? testValue.toFixed(1) : temp.toFixed(1)}°C
+                {(serialConnected ? temp : (testMode ? testValue : temp)).toFixed(1)}°C
               </div>
             </div>
 
