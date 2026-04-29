@@ -1,15 +1,19 @@
 // HIL Grove sketch — Arduino Uno + Grove Beginner Kit
 //
-// OLED is currently disabled because U8g2's begin() hangs when the SSD1315 on
-// some Grove Beginner Kit revisions doesn't ACK on I2C. The pot + LED + serial
-// protocol still work without it. Re-enable the OLED block at the bottom of
-// this file once you've verified the display responds (e.g. with an I2C
-// scanner sketch).
+// Library required (install via Arduino IDE → Library Manager):
+//   - U8g2 by olikraus
 //
 // Pins (default Grove Beginner Kit wiring):
 //   - Rotary potentiometer .... A0
 //   - Onboard LED ............. D4
-//   - OLED display ............ I2C (SDA = A4, SCL = A5)  [disabled]
+//   - OLED display ............ I2C (SDA = A4, SCL = A5)
+//
+// Memory notes:
+//   - U8g2 in page-buffer mode (the "_1_" suffix) so the OLED costs ~128 B
+//     instead of ~1 KB; full buffer left no SRAM headroom on the Uno.
+//   - All Serial strings are kept in flash via F() and we use a fixed char[]
+//     for the input buffer — no String, no heap fragmentation.
+//   - I2C bus is forced to 100 kHz; SSD1315 hangs U8g2's begin() at 400 kHz.
 //
 // Serial protocol (115200 baud, newline-terminated):
 //   Outbound (Arduino → bridge):
@@ -20,51 +24,82 @@
 //     SET:VAL:<float>        set the fixed test value (also enables test mode)
 //     CMD:LIGHT:ON|OFF|TOGGLE control the LED
 
+#include <U8g2lib.h>
+#include <Wire.h>
+
 const int POT_PIN = A0;
 const int LED_PIN = 4;
 
-bool  testMode      = false;
-float testValue     = 25.0;
-bool  ledOn         = false;
-float lastSentTemp  = -999.0;
-unsigned long lastReportMs = 0;
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+
+bool  testMode     = false;
+float testValue    = 25.0;
+bool  ledOn        = false;
+float lastSentTemp = -999.0;
+unsigned long lastReportMs  = 0;
+unsigned long lastDisplayMs = 0;
 const unsigned long REPORT_MIN_INTERVAL_MS = 200;
 const unsigned long REPORT_HEARTBEAT_MS    = 1000;
+const unsigned long DISPLAY_INTERVAL_MS    = 200;
 
-String inputBuffer = "";
+char inputBuffer[48];
+byte inputLen = 0;
 
 float readPotTemp() {
   int raw = analogRead(POT_PIN);
-  return raw * (150.0f / 1023.0f);  // map 0–1023 to 0–150 °C
+  return raw * (150.0f / 1023.0f);  // 0–1023 → 0–150 °C
 }
 
-void sendLine(const String& line) {
-  Serial.println(line);
+void displayUpdate(float temp) {
+  char tempBuf[10];
+  dtostrf(temp, 4, 1, tempBuf);
+
+  oled.firstPage();
+  do {
+    oled.setFont(u8g2_font_6x12_tr);
+    oled.drawStr(0, 10, "HIL SENSOR");
+    oled.drawStr(96, 10, testMode ? "TEST" : "LIVE");
+
+    oled.setFont(u8g2_font_logisoso24_tr);
+    oled.drawStr(0, 44, tempBuf);
+
+    oled.drawCircle(95, 22, 2);
+    oled.setFont(u8g2_font_6x12_tr);
+    oled.drawStr(102, 32, "C");
+
+    oled.drawStr(0, 62, ledOn ? "LED: ON" : "LED: OFF");
+  } while (oled.nextPage());
 }
 
-void handleCommand(String cmd) {
-  cmd.trim();
-  if (cmd.length() == 0) return;
+void sendRpt(float val) {
+  Serial.print(F("RPT:TEMP:"));
+  Serial.println(val, 1);
+}
 
-  if (cmd == "SET:TEST:ON") {
+void sendAck(bool on) {
+  Serial.println(on ? F("ACK:LIGHT:ON") : F("ACK:LIGHT:OFF"));
+}
+
+void handleCommand(const char* cmd) {
+  if (strcmp(cmd, "SET:TEST:ON") == 0) {
     testMode = true;
-  } else if (cmd == "SET:TEST:OFF") {
+  } else if (strcmp(cmd, "SET:TEST:OFF") == 0) {
     testMode = false;
-  } else if (cmd.startsWith("SET:VAL:")) {
-    testValue = cmd.substring(8).toFloat();
+  } else if (strncmp(cmd, "SET:VAL:", 8) == 0) {
+    testValue = atof(cmd + 8);
     if (!testMode) testMode = true;
-  } else if (cmd == "CMD:LIGHT:ON") {
+  } else if (strcmp(cmd, "CMD:LIGHT:ON") == 0) {
     ledOn = true;
     digitalWrite(LED_PIN, HIGH);
-    sendLine("ACK:LIGHT:ON");
-  } else if (cmd == "CMD:LIGHT:OFF") {
+    sendAck(true);
+  } else if (strcmp(cmd, "CMD:LIGHT:OFF") == 0) {
     ledOn = false;
     digitalWrite(LED_PIN, LOW);
-    sendLine("ACK:LIGHT:OFF");
-  } else if (cmd == "CMD:LIGHT:TOGGLE") {
+    sendAck(false);
+  } else if (strcmp(cmd, "CMD:LIGHT:TOGGLE") == 0) {
     ledOn = !ledOn;
     digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
-    sendLine(ledOn ? "ACK:LIGHT:ON" : "ACK:LIGHT:OFF");
+    sendAck(ledOn);
   }
 }
 
@@ -72,6 +107,12 @@ void setup() {
   Serial.begin(115200);
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+
+  Wire.begin();
+  Wire.setClock(100000);
+  oled.setBusClock(100000);
+  oled.setI2CAddress(0x3C << 1);
+  oled.begin();
 }
 
 void loop() {
@@ -79,12 +120,13 @@ void loop() {
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
-      if (inputBuffer.length() > 0) {
+      if (inputLen > 0) {
+        inputBuffer[inputLen] = '\0';
         handleCommand(inputBuffer);
-        inputBuffer = "";
+        inputLen = 0;
       }
-    } else {
-      inputBuffer += c;
+    } else if (inputLen < sizeof(inputBuffer) - 1) {
+      inputBuffer[inputLen++] = c;
     }
   }
 
@@ -98,20 +140,13 @@ void loop() {
   bool heartbeatElapsed = (now - lastReportMs) >= REPORT_HEARTBEAT_MS;
 
   if ((intervalElapsed && (significant || thresholdCross)) || heartbeatElapsed) {
-    sendLine("RPT:TEMP:" + String(currentTemp, 1));
+    sendRpt(currentTemp);
     lastSentTemp = currentTemp;
     lastReportMs = now;
   }
-}
 
-// ----------------------------------------------------------------------------
-// OLED block — re-enable once your display ACKs on I2C.
-//
-// 1. #include <U8g2lib.h>  // and <Wire.h>
-// 2. Declare the driver:
-//      U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
-// 3. Add to setup():
-//      oled.begin();
-// 4. Re-add a displayUpdate() call to loop() (~10 Hz) and restore the body
-//    that draws temp + LED state with u8g2_font_logisoso24_tr.
-// ----------------------------------------------------------------------------
+  if (now - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
+    displayUpdate(currentTemp);
+    lastDisplayMs = now;
+  }
+}
