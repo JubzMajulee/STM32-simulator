@@ -45,6 +45,27 @@ const App = () => {
   const [pieStatus, setPieStatus] = useState('disconnected'); // 'connecting' | 'connected' | 'disconnected'
   const [serialConnected, setSerialConnected] = useState(false);
   const [serialError, setSerialError] = useState('');
+  const [pieUrlInput, setPieUrlInput] = useState(() => {
+    try { return localStorage.getItem('pieUrl') || ''; } catch { return ''; }
+  });
+  const [pieUrl, setPieUrl] = useState(() => {
+    try { return localStorage.getItem('pieUrl') || ''; } catch { return ''; }
+  });
+
+  const loadPie = () => {
+    const v = pieUrlInput.trim();
+    setPieUrl(v);
+    try {
+      if (v) localStorage.setItem('pieUrl', v);
+      else localStorage.removeItem('pieUrl');
+    } catch { /* localStorage may be blocked */ }
+  };
+
+  const clearPie = () => {
+    setPieUrl('');
+    setPieUrlInput('');
+    try { localStorage.removeItem('pieUrl'); } catch { /* noop */ }
+  };
 
   const logEndRef = useRef(null);
   const socketRef = useRef(null);
@@ -486,12 +507,53 @@ const App = () => {
 
         <Card title="Product UI (ProtoPie)" icon={Layout} color="border-green-500/30">
           <div className="flex flex-col h-full gap-4">
-            <div
-              id="protopie-stage-slot"
-              className="flex-1 rounded-2xl border-2 border-dashed border-slate-700 flex items-center justify-center text-center text-[10px] font-mono uppercase text-slate-600 tracking-widest"
-            >
-              ProtoPie Stage Overlay
-            </div>
+            {!pieUrl ? (
+              <div
+                id="protopie-stage-slot"
+                className="flex-1 min-h-0 rounded-2xl border-2 border-dashed border-slate-700 flex flex-col items-center justify-center gap-3 p-4"
+              >
+                <span className="text-[10px] font-mono uppercase text-slate-600 tracking-widest">
+                  ProtoPie URL
+                </span>
+                <input
+                  type="text"
+                  value={pieUrlInput}
+                  onChange={(e) => setPieUrlInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') loadPie(); }}
+                  placeholder="https://cloud.protopie.io/p/..."
+                  className="w-full bg-black border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono focus:border-green-500 outline-none text-white"
+                />
+                <button
+                  onClick={loadPie}
+                  disabled={!pieUrlInput.trim()}
+                  className="bg-green-700 hover:bg-green-600 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold text-xs px-4 py-2 rounded transition"
+                >
+                  Load Pie
+                </button>
+                <span className="text-[9px] text-slate-600 text-center">
+                  Paste a Pie share URL or local Connect preview link.
+                </span>
+              </div>
+            ) : (
+              <div
+                id="protopie-stage-slot"
+                className="flex-1 min-h-0 relative rounded-2xl overflow-hidden bg-black border border-slate-700"
+              >
+                <iframe
+                  src={pieUrl}
+                  title="ProtoPie"
+                  className="w-full h-full block border-0"
+                  allow="autoplay; clipboard-read; clipboard-write; gyroscope; accelerometer; microphone; camera"
+                  referrerPolicy="no-referrer"
+                />
+                <button
+                  onClick={clearPie}
+                  className="absolute top-2 right-2 bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white text-[10px] font-bold px-2 py-1 rounded border border-slate-700"
+                >
+                  Change URL
+                </button>
+              </div>
+            )}
 
             <div className={`p-3 rounded-lg border flex items-center justify-between gap-3 transition-colors ${
               pieStatus === 'connected'
